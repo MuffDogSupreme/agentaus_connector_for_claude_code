@@ -358,6 +358,9 @@ class ConversationCompactor:
         # the merge (or is cut by BRIDGE_TURN_TIMEOUT) otherwise re-runs all ~34 chunk and gap
         # calls on the client's retry. Cached chunks resume instantly, so retry is cheap.
         self._chunk_cache: OrderedDict[str, str] = OrderedDict()
+        # Head-hashes that blew the summarisation budget (see compact()); an immediate retry with
+        # the same head trims at once rather than re-entering the frozen loop (Step 3).
+        self._timeout_mem: OrderedDict[str, bool] = OrderedDict()
         # (length, hash, summary) for prefixes already summarised.
         self._prefixes: list[tuple[int, str, str]] = []
         self._cache_size = cache_size
@@ -496,18 +499,24 @@ class ConversationCompactor:
         """
         batch = 4
         while len(parts) > 1:
-            next_level = []
             groups = [parts[i:i + batch] for i in range(0, len(parts), batch)]
-            for group in groups:
+
+            async def _merge_group(group: list[str]) -> str:
                 if len(group) == 1:
-                    next_level.append(group[0])
-                    continue
-                merged = await self._call(
-                    _styled(MERGE_INSTRUCTION) + "\n"
-                    + prompt_style.data("summaries", "\n\n---\n\n".join(group)) + "\n"
-                )
-                next_level.append(merged.strip() or "\n\n---\n\n".join(group))
-            parts = next_level
+                    return group[0]
+                try:
+                    merged = await self._call(
+                        _styled(MERGE_INSTRUCTION) + "\n"
+                        + prompt_style.data("summaries", "\n\n---\n\n".join(group)) + "\n"
+                    )
+                    return merged.strip() or "\n\n---\n\n".join(group)
+                except Exception as exc:  # noqa: BLE001 - a broken merge must not lose the record
+                    log.warning("merge call failed (%s); raw-joining the batch", exc)
+                    return "\n\n---\n\n".join(group)
+
+            # The batches within a level run concurrently under the gate; levels wait on the
+            # previous one only because a level needs every batch above it.
+            parts = await asyncio.gather(*[_merge_group(g) for g in groups])
         return parts[0] if parts else ""
 
     async def summarise_head(
@@ -606,6 +615,7 @@ class ConversationCompactor:
         keep_fraction: float = 0.5,
         threshold: float = 1.0,
         chunk_tokens: int | None = None,
+        timeout_s: float | None = None,
     ) -> dict:
         """Return a plan describing how to fit `body` into `limit`.
 
@@ -638,22 +648,48 @@ class ConversationCompactor:
         if not head:
             return {"messages": tail, "summary": None, "summarised": 0, "method": "none"}
 
+        # The room the summary can actually occupy: the window minus the verbatim tail,
+        # the system/tools overhead, and the reply reserve. This - not the per-chunk size -
+        # is what the shrink loop should aim at; a summary of a large head that still leaves
+        # the request under the window never needs shrinking to 6,000 tokens.
+        tail_cost = estimate_request_tokens(
+            {"system": body.get("system"), "messages": tail, "tools": body.get("tools")}
+        ) + reserve
+        shrink_limit = max(limit - tail_cost, chunk_tokens or max(budget // 4, 1000) // 2)
+
+        head_key = self._key(head)
         summary = ""
-        try:
-            # The room the summary can actually occupy: the window minus the verbatim tail,
-            # the system/tools overhead, and the reply reserve. This - not the per-chunk size -
-            # is what the shrink loop should aim at; a summary of a large head that still leaves
-            # the request under the window never needs shrinking to 6,000 tokens.
-            tail_cost = estimate_request_tokens(
-                {"system": body.get("system"), "messages": tail, "tools": body.get("tools")}
-            ) + reserve
-            shrink_limit = max(limit - tail_cost, chunk_tokens or max(budget // 4, 1000) // 2)
-            summary = await self.summarise_head(
-                head, chunk_budget=chunk_tokens or max(budget // 4, 1000),
-                shrink_limit=shrink_limit,
-            )
-        except Exception as exc:  # fall back rather than fail the turn
-            log.warning("summarisation failed (%s); falling back to trimming", exc)
+        # Step 3 fast path: a head whose summarisation already blew the budget is trimmed
+        # directly on an immediate retry, instead of re-entering the loop that just froze
+        # for a whole compaction. The LRU bound keeps one timeout from poisoning later turns.
+        if head_key in self._timeout_mem:
+            self._timeout_mem.move_to_end(head_key)
+            log.warning("compaction for this conversation already timed out; trimming directly")
+        else:
+            try:
+                run = self.summarise_head(
+                    head, chunk_budget=chunk_tokens or max(budget // 4, 1000),
+                    shrink_limit=shrink_limit,
+                )
+                if timeout_s and timeout_s > 0:
+                    summary = await asyncio.wait_for(run, timeout=timeout_s)
+                else:
+                    summary = await run
+            except asyncio.TimeoutError:
+                self._timeout_mem[head_key] = True
+                self._timeout_mem.move_to_end(head_key)
+                while len(self._timeout_mem) > self._cache_size:
+                    self._timeout_mem.popitem(last=False)
+                log.warning(
+                    "summarisation exceeded %.0fs; falling back to trimming "
+                    "(an immediate retry trims directly)", timeout_s,
+                )
+            except Exception as exc:  # fall back rather than fail the turn
+                log.warning("summarisation failed (%s); falling back to trimming", exc)
+            else:
+                # It finished (possibly reusing cached chunks): the result is in the summary
+                # cache, so a later identical retry is cheap and any earlier flag no longer applies.
+                self._timeout_mem.pop(head_key, None)
 
         # The opening request and any background-task report, word for word, when they fit.
         # Measured (d12 c1913h): one compaction summarised the "ultracode:" request, the

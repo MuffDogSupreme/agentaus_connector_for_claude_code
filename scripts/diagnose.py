@@ -153,6 +153,46 @@ TURN = re.compile(r"recv model=(\S+) route=(\w+)")
 SEARCH = re.compile(r"bridge tool agentaus_\w+ ran in ([\d.]+)s")
 COMPACT = re.compile(r"compaction done in ([\d.]+)s")
 
+# The SIGNALS sweep above is one regex over the whole text, which cannot express three
+# things this log actually says: density of 429s (a storm), a "compaction start" with no
+# matching end (a hang), and one token modifying another (gemini plus an error). These
+# detectors live in main() with line pairing instead. The exact strings this branch
+# emits are matched first; the surrounding tokens are a safety net, because the running
+# bridge at ../agentaus-bridge-run may log strings a fresh clone does not (gemini).
+RATE_LIMIT = re.compile(r"\b429\b|rate[\s-]?limit|quota|exceeded your current quota", re.I)
+COMPACT_START = re.compile(r"compaction start")
+COMPACT_END = re.compile(r"compaction (?:done in|ended after) ([\d.]+)s")
+GEMINI_HINT = re.compile(r"gemini", re.I)
+GEMINI_ERROR = re.compile(r"\berror\b|exception|traceback|quota|\b429\b|5\d\d|timed? ?out", re.I)
+# A compaction over this long is not slow, it is wedged: BRIDGE_TURN_TIMEOUT defaults to
+# 900s, and a phase that beats it is exactly the hang AGENTAUS_COMPACT_TIMEOUT exists to
+# bound. Mirrors _Phase's own contract: "a phase that never finishes only shows up in
+# the log as a start with no matching end."
+COMPACT_HANG_S = 900.0
+# A "storm" is this many 429/rate/quota lines, each within this many lines of the next -
+# dense retries against an endpoint that is not going to answer, not single blips.
+STORM_SPAN_LINES = 60
+STORM_MIN_HITS = 5
+
+
+def _storms(hits: list[int], span: int = STORM_SPAN_LINES, min_hits: int = STORM_MIN_HITS) -> list[list[int]]:
+    """Split matching line indices into bursts whose hits stay within `span` lines.
+
+    Short-lived rate limits back off and stop; a storm is retries that keep coming in a
+    tight cluster - the "85 x 429s" failure mode. Only clusters dense and large enough
+    to matter are returned.
+    """
+    groups: list[list[int]] = []
+    current: list[int] = []
+    for i in hits:
+        if current and i - current[-1] > span:
+            groups.append(current)
+            current = []
+        current.append(i)
+    if current:
+        groups.append(current)
+    return [g for g in groups if len(g) >= min_hits]
+
 
 def main() -> int:
     path = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/agentaus-bridge.log")
@@ -187,6 +227,60 @@ def main() -> int:
         count = len(re.findall(pattern, text))
         if count:
             found.append((count, severity, label, means, action))
+
+    # --- 429 / rate-limit storm -----------------------------------------------------
+    rate_hits = [i for i, ln in enumerate(lines) if RATE_LIMIT.search(ln)]
+    storms = _storms(rate_hits)
+    if storms:
+        # One representative row per burst, so a day of scattered clusters reads clearly.
+        for hits in storms:
+            found.append((len(hits), "high", "rate-limit storm",
+                          f"{len(hits)} x HTTP 429 / rate-limit / quota lines within {STORM_SPAN_LINES} "
+                          f"lines (lines {hits[0] + 1}-{hits[-1] + 1}).",
+                          "The tenant is being hammered and every hit only earned backoff - a 429 is "
+                          "retryable, not free. Lower AGENTAUS_MAX_CONCURRENCY / "
+                          "AGENTAUS_UPSTREAM_CONCURRENCY, or top up the quota if these are 402s."))
+
+    # --- compaction that started but never finished ----------------------------------
+    # Pair each "compaction start" with the next "done in / ended after" line between it
+    # and the following start; a start with no such end before the next start (or EOF) is
+    # a hang. _Phase logs exactly this contract: "a phase that never finishes only shows
+    # up in the log as a start with no matching end."
+    starts = [i for i, ln in enumerate(lines) if COMPACT_START.search(ln)]
+    ends = [i for i, ln in enumerate(lines) if COMPACT_END.search(ln)]
+    hangs = [
+        i for idx, i in enumerate(starts)
+        if not any(i < e < (starts[idx + 1] if idx + 1 < len(starts) else len(lines)) for e in ends)
+    ]
+    for i in hangs:
+        found.append((1, "high", "compaction never finished",
+                      f"a compaction started (line {i + 1}) with no matching 'done in' / "
+                      "'ended after' line before the next compaction or end of log.",
+                      "Compaction that never ends is the loop that beat BRIDGE_TURN_TIMEOUT. Lower "
+                      "AGENTAUS_COMPACT_TIMEOUT so the turn falls back to trimming instead of hanging."))
+    # A compaction that finished (or ended on an error) only after a wedged-length time is
+    # the same class - it soaked up most of the turn and left nothing for the answer.
+    for ln in lines:
+        m = COMPACT_END.search(ln)
+        if not m:
+            continue
+        dur = float(m.group(1))
+        if dur >= COMPACT_HANG_S:
+            found.append((1, "medium", "compaction took too long",
+                          f"a compaction ran {dur:.0f}s - at the {COMPACT_HANG_S:.0f}s edge of "
+                          f"BRIDGE_TURN_TIMEOUT.",
+                          "Lower AGENTAUS_COMPACT_TIMEOUT (defaults to 180s, and 0 disables the "
+                          "fallback) so a slow compaction yields to trimming before the turn dies."))
+
+    # --- gemini lines that also carry an error ---------------------------------------
+    gemini_bad = [i for i, ln in enumerate(lines)
+                  if GEMINI_HINT.search(ln) and GEMINI_ERROR.search(ln)]
+    if gemini_bad:
+        found.append((len(gemini_bad), "high", "gemini errors",
+                      f"{len(gemini_bad)} line(s) mention gemini alongside an error, quota, "
+                      f"429 or 5xx (e.g. line {gemini_bad[0] + 1}).",
+                      "This branch has no gemini support - the running bridge may log these with "
+                      "the API key / quota it holds. Check AGENTAUS_API_KEY and the quota."))
 
     order = {"high": 0, "medium": 1, "low": 2}
     found.sort(key=lambda row: (order[row[1]], -row[0]))

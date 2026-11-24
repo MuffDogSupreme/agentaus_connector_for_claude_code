@@ -561,13 +561,31 @@ def _retry_delay(attempt: int) -> float:
 _FAILED_ATTEMPT_S = 125.0
 
 
-async def _sleep_before_retry(attempt: int, why: str) -> None:
-    delay = _retry_delay(attempt)
+async def _sleep_before_retry(attempt: int, why: str, min_delay: float = 0.0) -> None:
+    # A 429 that names its own wait (Retry-After) is the upstream's word on when the rate
+    # limit lifts; wait at least that long, never past one turn timeout.
+    cap = settings.turn_timeout_seconds or _retry_delay(attempt)
+    delay = max(_retry_delay(attempt), min(min_delay, cap))
     rlog(logging.WARNING, "upstream attempt %d failed (%s); retrying in %.2fs", attempt + 1, why, delay)
     # Neither the failed attempt nor this wait counts against the turn's timeout: retrying
     # through a slump is waiting, not being wedged (see flight.Flight.served).
     flight.note_wait(delay + (_FAILED_ATTEMPT_S if why.startswith(("HTTP 52", "HTTP 504", "ReadTimeout")) else 0.0))
     await asyncio.sleep(delay)
+
+
+def _retry_after_of(response: httpx.Response) -> float:
+    """The Retry-After header as seconds when it is numeric and plausible, else 0.0.
+
+    A 429 that names its own wait is the upstream's word on when the rate limit lifts;
+    an HTTP-date form is not a duration so it is ignored and the normal backoff applies.
+    """
+    raw = (response.headers.get("Retry-After") or "").strip()
+    if not raw or not all(c.isdigit() or c == "." for c in raw):
+        return 0.0
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 0.0
 
 
 # Gateway timeouts are in _RETRYABLE_STATUS because a busy gateway often succeeds on a
@@ -695,7 +713,8 @@ async def _post_with_retry(
                      "it", response.status_code)
                 return response
             await response.aread()  # release the connection before sleeping
-            await _sleep_before_retry(attempt, f"HTTP {response.status_code}")
+            await _sleep_before_retry(attempt, f"HTTP {response.status_code}",
+                                      min_delay=_retry_after_of(response))
             continue
         if response.status_code == 200 and attempt < settings.max_retries:
             # An HTTP 200 carrying an error object: retry it when it is the upstream's own
@@ -897,6 +916,11 @@ async def _helper_call(
         try:
             return await _stream_helper(client, payload, text, started_at, on_piece)
         except (httpx.HTTPError, RuntimeError) as exc:
+            # A 429 is a rate limit, not a stream framing fault: re-sending the SAME payload
+            # buffered doubles the hit on an upstream that just said to slow down, and is one
+            # of the "aggressive immediate retries" the plan names as compounding the freeze.
+            if "429" in str(exc) or "rate" in str(exc).lower():
+                raise
             # Falling back rather than failing: a streaming fault must not cost the
             # caller its summary when the buffered path still works.
             rlog(logging.WARNING, "streamed helper call failed (%s); retrying buffered", exc)
@@ -2131,6 +2155,7 @@ async def _fit_to_window(
         keep_fraction=settings.agentaus_keep_fraction,
         threshold=threshold,
         chunk_tokens=settings.agentaus_summary_chunk_tokens,
+        timeout_s=settings.agentaus_compact_timeout_s,
     )
     if plan["method"] == "summarised":
         fitted = {**body, "messages": plan["messages"]}
