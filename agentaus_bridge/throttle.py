@@ -42,8 +42,42 @@ from collections import deque
 import httpx
 
 from .config import settings
+from . import status
 
 log = logging.getLogger("agentaus-bridge")
+
+
+def _note_status(outcome: str, status_code: int | None, kind: str) -> None:
+    """Report a settled upstream outcome into the status tracker.
+
+    Synchronous and cheap; the transport is the one place every Agentaus call passes, so
+    this is where rate limits, connection failures, quota and recovery are noticed. A
+    request-specific failure (kind != "normal") is evidence about that request, not the
+    upstream, and is left to the log.
+    """
+    if status_code == 429:
+        status.record("rate_limited", "HTTP 429 - the tenant is rate-limited, retrying with backoff")
+        return
+    if status_code == 402:
+        status.record("quota", "top up the Agentaus quota before turns succeed")
+        return
+    if status_code in (401, 403):
+        status.record("key_rejected", f"HTTP {status_code} - check AGENTAUS_API_KEY")
+        return
+    if outcome == "ok":
+        status.resolve("rate_limited")
+        status.resolve("no_connection")
+        status.resolve("slow_upstream")
+        status.resolve("quota")
+        status.resolve("key_rejected")
+        return
+    if outcome == "fail":
+        if status_code is None:
+            status.record("no_connection", "network or DNS failure reaching agentaus.com.au")
+        elif status_code in (504, 520, 522, 524):
+            status.record("slow_upstream", f"HTTP {status_code} origin/gateway timeout")
+        else:
+            status.record("slow_upstream", f"HTTP {status_code}")
 
 # A gateway or upstream failure - the kind that says "send less", not "your request is wrong".
 _OVERLOAD = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529}
@@ -352,6 +386,7 @@ class LimitedTransport(httpx.AsyncBaseTransport):
                 outcome = "other"
             if outcome != "cancelled":
                 health().record(outcome, status, time.monotonic() - sent_at, width, kind)
+                _note_status(outcome, status, kind)
             await gate.release(outcome not in ("fail",), kind)
 
         try:

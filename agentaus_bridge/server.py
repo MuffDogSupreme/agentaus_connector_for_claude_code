@@ -33,8 +33,10 @@ from . import flight
 from . import graph
 from . import import_guard
 from . import harmony
+from . import notify
 from . import persisted
 from . import sessions
+from . import status
 from . import prompt_style
 from . import repair
 from . import syntax
@@ -304,6 +306,62 @@ async def list_models(request: Request) -> JSONResponse:
         "first_id": models[0]["id"],
         "last_id": models[-1]["id"],
     })
+
+
+# --------------------------------------------------------------------------------------
+# Status: what is wrong right now, for people and scripts
+# --------------------------------------------------------------------------------------
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/status.json")
+async def status_json() -> JSONResponse:
+    """Everything status knows: the current incidents (worst first), recent history, and the
+    health snapshot that /healthz/upstream already exposes. Cheap, read-only, no model calls."""
+    gate = throttle.limit()
+    data = status.snapshot()
+    data["health"] = throttle.health().snapshot(gate.limit, gate.ceiling, gate.busy)
+    data["flights"] = flight.running()
+    data["settings"] = {
+        "context_window": _context_limit(),
+        "notify": settings.agentaus_notify,
+        "env_file": status._env_file,
+    }
+    return JSONResponse(data)
+
+
+@app.get("/status")
+async def status_page() -> HTMLResponse:
+    """A plain auto-refreshing dashboard: current incident, recent history, upstream health.
+    No auth (localhost only by default), so keep it loopback-bound like the rest of the bridge."""
+    description = status.describe() or "All quiet."
+    active = status.active()
+    active_rows = "\n".join(
+        f"<tr><td>{i.kind}</td><td>{i.severity}</td>"
+        f"<td>{i.occurrences}</td><td>{html_escape(i.describe())}</td></tr>"
+        for i in active
+    ) or "<tr><td colspan='4'>none</td></tr>"
+    recent = status.recent(15)
+    recent_rows = "\n".join(
+        f"<tr><td>{t['kind']}</td><td>{t['severity']}</td>"
+        f"<td>{'resolved' if t['resolved'] else 'active'}</td>"
+        f"<td>{html_escape(t['detail'])}</td></tr>"
+        for t in recent
+    ) or "<tr><td colspan='4'>none</td></tr>"
+    return HTMLResponse(f"""<!doctype html><meta charset="utf-8"><title>Agentaus bridge status</title>
+<style>body{{font-family:system-ui,sans-serif;margin:2em;max-width:70em}}
+td,th{{padding:.35em .5em;border-bottom:1px solid #ddd;text-align:left}}table{{border-collapse:collapse;width:100%}}
+.bad{{color:#b00}}.ok{{color:#080}}</style>
+<h1>Agentaus bridge status</h1><p class="ok">{html_escape(description)}</p>
+<h2>Active incidents</h2><table><tr><th>kind</th><th>severity</th><th>occurrences</th><th>detail</th></tr>
+{active_rows}</table>
+<h2>Recent activity</h2><table><tr><th>kind</th><th>severity</th><th>state</th><th>detail</th></tr>
+{recent_rows}</table>
+<script>setTimeout(()=>location.reload(),10000)</script>
+""", headers={"cache-control": "no-cache"})
+
+
+from html import escape as html_escape
 
 
 # --------------------------------------------------------------------------------------

@@ -354,6 +354,10 @@ class ConversationCompactor:
         # Compaction itself blocks the turn, so it is not background work.
         self._priority = "normal"
         self._cache: OrderedDict[str, str] = OrderedDict()
+        # Per-chunk summary cache: chunk-text hash -> summary. A cold compaction that dies at
+        # the merge (or is cut by BRIDGE_TURN_TIMEOUT) otherwise re-runs all ~34 chunk and gap
+        # calls on the client's retry. Cached chunks resume instantly, so retry is cheap.
+        self._chunk_cache: OrderedDict[str, str] = OrderedDict()
         # (length, hash, summary) for prefixes already summarised.
         self._prefixes: list[tuple[int, str, str]] = []
         self._cache_size = cache_size
@@ -374,6 +378,26 @@ class ConversationCompactor:
         self._cache.move_to_end(key)
         while len(self._cache) > self._cache_size:
             self._cache.popitem(last=False)
+
+    @staticmethod
+    def _chunk_key(chunk: str) -> str:
+        """Content hash of one chunk's rendered text, so a retry recognises already-done chunks."""
+        return hashlib.sha256(chunk.encode("utf-8", "replace")).hexdigest()
+
+    def _cached_chunk(self, chunk: str) -> str | None:
+        key = self._chunk_key(chunk)
+        summary = self._chunk_cache.get(key)
+        if summary is not None:
+            self._chunk_cache.move_to_end(key)
+        return summary
+
+    def _remember_chunk(self, chunk: str, summary: str) -> None:
+        # Written after the first pass AND after the gap pass, so an interrupted run resumes
+        # from however far it got instead of redoing every chunk upstream call.
+        self._chunk_cache[self._chunk_key(chunk)] = summary
+        self._chunk_cache.move_to_end(self._chunk_key(chunk))
+        while len(self._chunk_cache) > self._cache_size:
+            self._chunk_cache.popitem(last=False)
 
     async def _call(self, prompt: str) -> str:
         """One summariser call, bounded by the bridge-wide concurrency cap.
@@ -404,12 +428,18 @@ class ConversationCompactor:
 
     async def _summarise_chunk(self, chunk: str, index: int, total: int) -> str:
         label = f" (part {index} of {total})" if total > 1 else ""
+        cached = self._cached_chunk(chunk)
+        if cached is not None:
+            return cached
+        # Remember one in-progress marker so a retry that dies mid-merge does not re-run this
+        # specific call, and write the real summary as soon as it is known.
         summary = normalise_identifiers(
             (await self._call(
                 _styled(SUMMARY_INSTRUCTION) + label
                 + "\n" + prompt_style.data("conversation", chunk) + "\n"
             )).strip()
         )
+        self._remember_chunk(chunk, summary)
         if not self._verify:
             return summary
 
@@ -429,6 +459,9 @@ class ConversationCompactor:
             self._priority = previous
         if gaps and gaps.upper().strip().rstrip(".") != "NONE":
             summary = summary + "\nAdditional details:\n" + gaps
+        # The gap pass finished: cache the final (first pass + gaps) result for this chunk so
+        # a later retry resumes past both upstream calls, not just the first one.
+        self._remember_chunk(chunk, summary)
         return summary
 
     def _find_prefix(self, head: list) -> tuple[int, str] | None:
@@ -452,12 +485,46 @@ class ConversationCompactor:
         while len(self._prefixes) > self._cache_size:
             self._prefixes.pop(0)
 
-    async def summarise_head(self, head: list, *, chunk_budget: int) -> str:
+    async def _merge_summaries(self, parts: list[str]) -> str:
+        """Merge many summaries into one, in a bounded fan-in.
+
+        The naive version merged every chunk summary in ONE prompt - a ~34-part merge that
+        took 4-7 minutes serial and blew the turn deadline. Merging in small batches (each
+        call handles at most 4 summaries) is log-depth, every call is small enough to stream
+        back quickly, and the batches within a level run concurrently under the gate. Falls
+        back to a raw join on any failure - a broken merge must not lose the record.
+        """
+        batch = 4
+        while len(parts) > 1:
+            next_level = []
+            groups = [parts[i:i + batch] for i in range(0, len(parts), batch)]
+            for group in groups:
+                if len(group) == 1:
+                    next_level.append(group[0])
+                    continue
+                merged = await self._call(
+                    _styled(MERGE_INSTRUCTION) + "\n"
+                    + prompt_style.data("summaries", "\n\n---\n\n".join(group)) + "\n"
+                )
+                next_level.append(merged.strip() or "\n\n---\n\n".join(group))
+            parts = next_level
+        return parts[0] if parts else ""
+
+    async def summarise_head(
+        self, head: list, *, chunk_budget: int, shrink_limit: int | None = None
+    ) -> str:
         """Summarise `head`, reusing cached work wherever possible.
 
         Three paths, cheapest first: an exact cache hit; an extension of a previously
         summarised prefix, where only the new messages are read; and a cold summary of
         the whole head.
+
+        `shrink_limit` is the most tokens the summary may occupy (the real room left in
+        the context window after the verbatim tail and overhead). The pre-standard shrink
+        loop compared the summary against the per-chunk size (6,000), so any real summary
+        of a large head looked "too big", triggering up to 3 more sequential multi-minute
+        merge calls - which is how a ~250k-token head blew past BRIDGE_TURN_TIMEOUT. It is
+        only worth shrinking when the summary would not fit the room it actually needs.
         """
         key = self._key(head)
         cached = self._cache.get(key)
@@ -483,12 +550,8 @@ class ConversationCompactor:
                     self._summarise_chunk(piece, i, len(pieces))
                     for i, piece in enumerate(pieces, 1)
                 ])
-                addition = "\n".join(s for s in new_parts if s.strip())
-                merged = await self._call(
-                    _styled(MERGE_INSTRUCTION) + "\n"
-                    + prompt_style.data("summaries", prior + "\n\n---\n\n" + addition) + "\n"
-                )
-                summary = merged.strip() or (prior + "\n" + addition)
+                new_parts = [s for s in new_parts if s.strip()]
+                summary = await self._merge_summaries([prior] + new_parts)
             else:
                 summary = prior
             self._remember(key, summary)
@@ -512,19 +575,23 @@ class ConversationCompactor:
         if len(summaries) == 1:
             summary = summaries[0]
         else:
-            joined = "\n\n---\n\n".join(summaries)
             # Merged by the model rather than concatenated: consecutive chunks overlap,
             # so raw concatenation repeats itself and reads as several disjoint records.
-            summary = (await self._call(
-                _styled(MERGE_INSTRUCTION) + "\n" + prompt_style.data("summaries", joined) + "\n"
-            )).strip() or joined
+            # Batched tree-merge (see _merge_summaries) so no single call carries ~34
+            # summaries - the one that took 4-7 minutes serial and blew the turn deadline.
+            summary = await self._merge_summaries(summaries)
 
-        rounds = 0
-        while estimate_tokens(summary) > chunk_budget and rounds < 3:
-            summary = (await self._call(
-                _styled(MERGE_INSTRUCTION) + "\n" + prompt_style.data("summaries", summary) + "\n"
-            )).strip()
-            rounds += 1
+        # Shrink only against what the summary actually has room for (the real window space
+        # left after tail + overhead), not the per-chunk size. A summary of a large head is
+        # allowed to be larger than one chunk; shrinking it down to 6,000 tokens wasted up to
+        # three sequential multi-minute calls and blew the turn deadline for zero benefit.
+        if shrink_limit and shrink_limit > 0:
+            rounds = 0
+            while estimate_tokens(summary) > shrink_limit and rounds < 3:
+                summary = (await self._call(
+                    _styled(MERGE_INSTRUCTION) + "\n" + prompt_style.data("summaries", summary) + "\n"
+                )).strip()
+                rounds += 1
 
         self._remember(key, summary)
         self._remember_prefix(head, summary)
@@ -573,8 +640,17 @@ class ConversationCompactor:
 
         summary = ""
         try:
+            # The room the summary can actually occupy: the window minus the verbatim tail,
+            # the system/tools overhead, and the reply reserve. This - not the per-chunk size -
+            # is what the shrink loop should aim at; a summary of a large head that still leaves
+            # the request under the window never needs shrinking to 6,000 tokens.
+            tail_cost = estimate_request_tokens(
+                {"system": body.get("system"), "messages": tail, "tools": body.get("tools")}
+            ) + reserve
+            shrink_limit = max(limit - tail_cost, chunk_tokens or max(budget // 4, 1000) // 2)
             summary = await self.summarise_head(
-                head, chunk_budget=chunk_tokens or max(budget // 4, 1000)
+                head, chunk_budget=chunk_tokens or max(budget // 4, 1000),
+                shrink_limit=shrink_limit,
             )
         except Exception as exc:  # fall back rather than fail the turn
             log.warning("summarisation failed (%s); falling back to trimming", exc)

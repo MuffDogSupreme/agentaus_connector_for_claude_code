@@ -756,6 +756,29 @@ class Settings:
     # Optional shared secret clients must present. Leave empty for localhost use.
     bridge_token: str = field(default_factory=lambda: os.environ.get("BRIDGE_TOKEN", ""))
 
+    # --- Status / notifications ---------------------------------------------------
+    # Whether to fire Windows desktop toasts when an upstream incident hurts. "off" (default)
+    # keeps the in-chat heartbeat text and /status page (which are always on); "toast" adds
+    # pop-ups. See agentaus_bridge/status.py and notify.py.
+    agentaus_notify: str = field(
+        default_factory=lambda: os.environ.get("AGENTAUS_NOTIFY", "off").strip().lower() or "off"
+    )
+    # A "soft" incident (429, no connection, slow upstream) toasts only once it has lasted
+    # this long. A single 429 that clears in a few seconds is normal; a persistent one is not.
+    agentaus_notify_after_s: float = field(
+        default_factory=lambda: _float("AGENTAUS_NOTIFY_AFTER_S", 30.0)
+    )
+    # Minimum gap between toasts for the same incident kind, so a flapping upstream cannot spam.
+    agentaus_notify_cooldown_s: float = field(
+        default_factory=lambda: _float("AGENTAUS_NOTIFY_COOLDOWN_S", 300.0)
+    )
+    # How long summarising compaction may run before the turn falls back to the trim/clip path
+    # rather than hanging to BRIDGE_TURN_TIMEOUT. On a 1M-window session a cold compaction of a
+    # ~250k head takes minutes; this bounds it so the turn still answers. 0 disables.
+    agentaus_compact_timeout_s: float = field(
+        default_factory=lambda: _float("AGENTAUS_COMPACT_TIMEOUT", 180.0)
+    )
+
     def routes_to_agentaus(self, model: str) -> bool:
         if self.force_all_to_agentaus:
             return True
